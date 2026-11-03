@@ -1,0 +1,142 @@
+name: togglemaster
+
+services:
+  # --- Dados ---
+  postgres-auth:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: auth_db
+      POSTGRES_USER: toggle
+      POSTGRES_PASSWORD: togglepass
+    volumes:
+      - ./auth-service/db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - pgauth_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U toggle -d auth_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres-core:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: flags_db
+      POSTGRES_USER: toggle
+      POSTGRES_PASSWORD: togglepass
+    volumes:
+      - ./flag-service/db/init.sql:/docker-entrypoint-initdb.d/01-flags-init.sql:ro
+      - ./targeting-service/db/init.sql:/docker-entrypoint-initdb.d/extra/targeting-init.sql:ro
+      - ./db-init/02-targeting-db.sh:/docker-entrypoint-initdb.d/02-targeting-db.sh:ro
+      - pgcore_data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U toggle -d flags_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    ports:
+      - "8000:8000"
+
+  # --- Aplicações ---
+  auth-service:
+    build: ./auth-service
+    environment:
+      DATABASE_URL: postgres://toggle:togglepass@postgres-auth:5432/auth_db
+      PORT: "8001"
+      MASTER_KEY: admin-secreto-123
+    depends_on:
+      postgres-auth:
+        condition: service_healthy
+    ports:
+      - "8001:8001"
+
+  flag-service:
+    build: ./flag-service
+    environment:
+      DATABASE_URL: postgres://toggle:togglepass@postgres-core:5432/flags_db
+      PORT: "8002"
+      AUTH_SERVICE_URL: http://auth-service:8001
+    depends_on:
+      postgres-core:
+        condition: service_healthy
+      auth-service:
+        condition: service_started
+    ports:
+      - "8002:8002"
+
+  targeting-service:
+    build: ./targeting-service
+    environment:
+      DATABASE_URL: postgres://toggle:togglepass@postgres-core:5432/targeting_db
+      PORT: "8003"
+      AUTH_SERVICE_URL: http://auth-service:8001
+    depends_on:
+      postgres-core:
+        condition: service_healthy
+      auth-service:
+        condition: service_started
+    ports:
+      - "8003:8003"
+
+  evaluation-service:
+    build: ./evaluation-service
+    environment:
+      PORT: "8004"
+      REDIS_URL: redis://redis:6379
+      FLAG_SERVICE_URL: http://flag-service:8002
+      TARGETING_SERVICE_URL: http://targeting-service:8003
+      SERVICE_API_KEY: ${EVALUATION_SERVICE_API_KEY:-}
+      # Opcional no Dia 1 - sem isso o serviço só loga "[SQS_DISABLED]" (ver sqs.go)
+      AWS_SQS_URL: ${AWS_SQS_URL:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+      flag-service:
+        condition: service_started
+      targeting-service:
+        condition: service_started
+    ports:
+      - "8004:8004"
+
+  analytics-service:
+    build: ./analytics-service
+    environment:
+      PORT: "8005"
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      # analytics-service EXIGE essas 3 vars (sys.exit(1) se faltar alguma) -
+      # a fila precisa ser uma fila SQS real já criada na AWS.
+      AWS_SQS_URL: ${AWS_SQS_URL}
+      AWS_DYNAMODB_TABLE: ToggleMasterAnalytics
+      # Patch do Dia 1: aponta só o client do DynamoDB pro container local.
+      AWS_DYNAMODB_ENDPOINT_URL: http://dynamodb-local:8000
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-local}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-local}
+    depends_on:
+      dynamodb-local:
+        condition: service_started
+    ports:
+      - "8005:8005"
+
+volumes:
+  pgauth_data:
+  pgcore_data:

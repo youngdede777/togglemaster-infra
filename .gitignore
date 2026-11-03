@@ -1,0 +1,6 @@
+.env
+auth-service/
+flag-service/
+targeting-service/
+evaluation-service/
+analytics-service/
